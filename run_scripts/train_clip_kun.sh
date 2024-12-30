@@ -17,8 +17,9 @@ export MASTER_ADDR=XX.XX.XX.XX
 export MASTER_PORT=8514
 # The rank of this worker, should be in {0, ..., WORKER_CNT-1}, for single-worker training, please set to 0
 export RANK=0
-
+# export RANK=$GLOBAL_ID
 export PYTHONPATH=${PYTHONPATH}:`pwd`/cn_clip/
+export USE_NEW_GET_LOSS=1
 
 DATAPATH=${1}
 
