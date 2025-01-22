@@ -17,6 +17,60 @@ from cn_clip.clip.model import convert_state_dict
 def is_master(args):
     return args.rank == 0
 
+def get_loss_jk(model, images, texts, loss_img, loss_txt, args, accum_image_features=None, accum_text_features=None, accum_idx=-1):
+    if args.accum_freq == 1:
+        image_features, text_features, logit_scale = model(images, texts)
+    else:
+        assert accum_image_features and accum_text_features and accum_idx != -1
+        chunk_image_features, chunk_text_features, logit_scale = model(images, texts)
+        image_features = torch.cat(
+            accum_image_features[:accum_idx] + [chunk_image_features] + accum_image_features[accum_idx + 1:])
+        text_features = torch.cat(
+            accum_text_features[:accum_idx] + [chunk_text_features] + accum_text_features[accum_idx + 1:])
+    logit_scale = logit_scale.mean()
+    
+    if args.aggregate:
+        world_size = dist.get_world_size()
+        rank = dist.get_rank()
+
+        # We gather tensors from all gpus to get more negatives to contrast with.
+        if args.gather_with_grad:
+            all_image_features = torch.cat(torch.distributed.nn.all_gather(image_features), dim=0)
+            all_text_features = torch.cat(torch.distributed.nn.all_gather(text_features), dim=0)
+        else:
+            raise NotImplementedError
+            
+        # this is needed to send gradients back everywhere.
+        logits_per_image = logit_scale * image_features @ all_text_features.t()
+        logits_per_text = logit_scale* text_features @ all_image_features.t()
+
+        # logits_per_text = logits_per_image.t()
+
+    else:
+        raise NotImplementedError
+
+    ground_truth = torch.arange(len(logits_per_image)).long() + len(logits_per_image)*rank
+    ground_truth = ground_truth.cuda(args.local_device_rank, non_blocking=True)
+
+    total_loss = (
+        loss_img(logits_per_image, ground_truth)
+        + loss_txt(logits_per_text, ground_truth)
+    ) / 2
+
+    total_loss = torch.stack(torch.distributed.nn.all_gather(total_loss)).mean()
+    acc = None
+    if args.report_training_batch_acc:
+        i2t_acc = (logits_per_image.argmax(-1) == ground_truth).sum() / len(logits_per_image)
+        t2i_acc = (logits_per_text.argmax(-1) == ground_truth).sum() / len(logits_per_text)
+        acc = {"i2t": i2t_acc, "t2i": t2i_acc}
+
+    return total_loss, acc
+
+
+if 'USE_NEW_GET_LOSS' in os.environ:
+    get_loss = get_loss_jk
+
+
 def get_loss(model, images, texts, loss_img, loss_txt, args, accum_image_features=None, accum_text_features=None, accum_idx=-1):
     if args.accum_freq == 1:
         image_features, text_features, logit_scale = model(images, texts, args.mask_ratio)
@@ -128,11 +182,11 @@ def train(model, data, epoch, optimizer, scaler, scheduler, args, global_trained
 
         optimizer.zero_grad()
 
-        images, texts, eos_indices = batch
+        images, texts = batch
 
         images = images.cuda(args.local_device_rank, non_blocking=True)
-        texts = texts.cuda(args.local_device_rank, non_blocking=True)
-        eos_indices = eos_indices.cuda(args.local_device_rank, non_blocking=True)
+        texts = dict(input_ids=texts.input_ids.squeeze().cuda(args.local_device_rank, non_blocking=True), 
+                    attention_mask=texts.attention_mask.squeeze().cuda(args.local_device_rank, non_blocking=True))
 
         data_time = time.time() - end
 
