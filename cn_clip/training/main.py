@@ -20,6 +20,7 @@ from cn_clip.training.data import get_data
 from cn_clip.training.params import parse_args
 from cn_clip.training.logger import setup_primary_logging, setup_worker_logging
 from cn_clip.training.scheduler import cosine_lr
+from transformers import CLIPModel, CLIPFeatureExtractor, AutoTokenizer, CLIPTextModel
 
 
 # Used by https://github.com/openai/CLIP/issues/83 but not below.
@@ -75,68 +76,10 @@ def main():
     setup_worker_logging(args.rank, log_queue, args.log_level)
 
     # Build the CLIP model
-    vision_model_config_file = Path(__file__).parent.parent / f"clip/model_configs/{args.vision_model.replace('/', '-')}.json"
-    print('Loading vision model config from', vision_model_config_file)
-    assert os.path.exists(vision_model_config_file)
+    clip_model = CLIPKUN(args=args)
+    clip_model.cuda(args.local_device_rank)
+    clip_model = torch.nn.parallel.DistributedDataParallel(clip_model, device_ids=[args.local_device_rank], find_unused_parameters=True)
     
-    text_model_config_file = Path(__file__).parent.parent / f"clip/model_configs/{args.text_model.replace('/', '-')}.json"
-    print('Loading text model config from', text_model_config_file)
-    assert os.path.exists(text_model_config_file)
-    
-    with open(vision_model_config_file, 'r') as fv, open(text_model_config_file, 'r') as ft:
-        model_info = json.load(fv)
-        if isinstance(model_info['vision_layers'], str):
-            model_info['vision_layers'] = eval(model_info['vision_layers'])         
-        for k, v in json.load(ft).items():
-            model_info[k] = v
-    model_info['use_flash_attention'] = args.use_flash_attention
-
-    model = CLIP(**model_info)
-    if args.clip_weight_path is not None:
-        assert os.path.exists(args.clip_weight_path), "Pretrained CLIP weight not exists!"
-    if args.bert_weight_path is not None:
-        assert os.path.exists(args.bert_weight_path), "Pretrained BERT weight not exists!"
-    load(model, clip_path=args.clip_weight_path, bert_path=args.bert_weight_path, use_flash_attention=args.use_flash_attention)
-
-    # See https://discuss.pytorch.org/t/valueerror-attemting-to-unscale-fp16-gradients/81372
-    if args.precision == "amp" or args.precision == "fp32":
-        convert_models_to_fp32(model)
-
-    model.cuda(args.local_device_rank)
-    if args.precision == "fp16":
-        convert_weights(model)
-
-    if args.grad_checkpointing:
-        assert not torch_version_str_compare_lessequal(torch.__version__, "1.8.0"), \
-            "Currently our grad_checkpointing is not compatible with torch version <= 1.8.0."        
-        model.set_grad_checkpointing()
-        logging.info("Grad-checkpointing activated.")
-
-    if args.use_flash_attention:
-        assert importlib.util.find_spec("flash_attn"), "flash_attn is not installed."
-        logging.info("Using FlashAttention.")
-
-    if args.use_bn_sync:
-        model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
-
-    if args.freeze_vision:
-        for k, v in model.visual.named_parameters():
-            v.requires_grad = False
-        # freeze bn running mean and variance
-        if args.vision_model in ['RN50']:
-            for m in model.visual.modules():
-                if isinstance(m, torch.nn.BatchNorm2d):
-                    m.eval()
-        logging.info("The visual encoder is freezed during training.")
-
-    # To make compatible with torch version <= 1.8.0, set find_unused_parameters to True
-    # In other cases, set find_unused_parameters to False
-    find_unused_parameters = torch_version_str_compare_lessequal(torch.__version__, "1.8.0")
-    model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.local_device_rank], find_unused_parameters=find_unused_parameters)
-
-    if args.precision == "fp16":
-        convert_weights(model)
-
     # Initialize dataset and dataloader
     data = get_data(args, epoch_id=0, max_txt_length=args.context_length)
 
@@ -195,49 +138,8 @@ def main():
     # Optionally resume from a checkpoint
     start_epoch = 0
     steps = 0
-    # Automatically restore latest checkpoint if exists
-    if args.resume is None:
-        latest_path = os.path.join(args.checkpoint_path, f"epoch_latest.pt")
-        if os.path.isfile(latest_path):
-            args.resume = latest_path
-    if args.resume is not None:
-        if os.path.isfile(args.resume):
-            logging.info(
-                f"=> begin to load checkpoint '{args.resume}'"
-            )
-            # Restore the model weight, map model to be loaded to specified single gpu.
-            # loc = "cuda:{}".format(args.local_device_rank)
-            checkpoint = torch.load(args.resume, map_location="cpu")
-            sd = {k: v for k, v in checkpoint["state_dict"].items() if "bert.pooler" not in k}
-            # Resize the positional embedding by interpolation, if needed
-            resize_pos_embed(sd, model, prefix="module.")
-            # Adapt flash attention
-            if args.use_flash_attention:
-                sd = convert_state_dict(sd)
-            # Load the state dict
-            model.load_state_dict(sd)
-            # Restore the epoch and steps info, reload the dataset and dataloader for the resume epoch
-            if not args.reset_data_offset:
-                start_epoch = checkpoint["epoch"] - 1
-                steps = checkpoint["step"]
-                data = get_data(args, 
-                                epoch_id=start_epoch, 
-                                max_txt_length=args.context_length)
-            # Restore the optim state
-            if not args.reset_optimizer and optimizer is not None:
-                optimizer.load_state_dict(checkpoint["optimizer"])
-                logging.info("=> optimizer state is restored from the checkpoint")
-            logging.info(
-                f"=> loaded checkpoint '{args.resume}' (epoch {checkpoint['epoch']} @ {steps} steps)"
-            )
-        else:
-            logging.info("=> no checkpoint found at '{}'".format(args.resume))
-
     cudnn.benchmark = True
     cudnn.deterministic = False
-
-    # determine if this worker should save logs and checkpoints.
-    # only do so if it is the 0th worker.
     args.should_save = (args.logs is not None and args.logs != '' and args.logs.lower() != 'none') and is_master(args)
 
     for epoch in range(start_epoch, args.max_epochs):
@@ -246,53 +148,16 @@ def main():
         num_steps_this_epoch = train(model, data, epoch, optimizer, scaler, scheduler, args, steps)
         steps += num_steps_this_epoch
 
-        if args.val_data is not None and args.valid_epoch_interval is not None and ((epoch + 1) % args.valid_epoch_interval) == 0:
-            assert "val" in data, "Error: Valid dataset has not been built."
-            if not args.use_flash_attention:
-                evaluate(model, data, epoch, args, steps)
-            else:
-                # fp16 is needed in flash attention
-                with torch.cuda.amp.autocast():
-                    evaluate(model, data, epoch, args, steps)
-
-        # if exists next epoch, reload the dataset and dataloader for the next epoch
-        if epoch + 1 < args.max_epochs:
-            data = get_data(args, epoch_id=epoch + 1, max_txt_length=args.context_length)
-
         # Saving checkpoints.
         if args.should_save and num_steps_this_epoch > 0:
             if (epoch + 1) == args.max_epochs or (
                 args.save_epoch_frequency > 0 and ((epoch + 1) % args.save_epoch_frequency) == 0
             ):
                 t1 = time.time()
-                save_path = os.path.join(args.checkpoint_path, f"epoch{epoch + 1}.pt")
-                torch.save(
-                    {
-                        "epoch": epoch + 1,
-                        "step": steps,
-                        "name": args.name,
-                        "state_dict": model.state_dict() if not args.use_flash_attention else convert_state_dict(model.state_dict()),
-                        "optimizer": optimizer.state_dict(),
-                    },
-                    save_path,
-                )
-                logging.info("Saved checkpoint {} (epoch {} @ {} steps) (writing took {} seconds)".format(save_path, epoch + 1, steps, time.time() - t1))
-            
-            # Save the latest params
-            t1 = time.time()
-            save_path = os.path.join(args.checkpoint_path, f"epoch_latest.pt")
-            torch.save(
-                {
-                    "epoch": epoch + 1,
-                    "step": steps,
-                    "name": args.name,
-                    "state_dict": model.state_dict() if not args.use_flash_attention else convert_state_dict(model.state_dict()),
-                    "optimizer": optimizer.state_dict(),
-                },
-                save_path,
-            )
-            logging.info("Saved checkpoint {} (epoch {} @ {} steps) (writing took {} seconds)".format(save_path, epoch + 1, steps, time.time() - t1))
+                clip_model.module.save_pretrained_model(save_dir)
 
-
+        if epoch + 1 < args.max_epochs:
+            data = get_data(args, epoch_id=epoch + 1, max_txt_length=args.context_length)
+                
 if __name__ == "__main__":
     main()
