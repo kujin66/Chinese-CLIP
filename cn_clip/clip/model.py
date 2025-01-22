@@ -286,6 +286,85 @@ class VisualTransformer(nn.Module):
 
         return x
 
+class CLIPKUN(nn.Module):
+    def __init__(self,
+                 args = None
+                 ):
+        super().__init__()
+        self.freeze_vision = args.freeze_vision
+        print(args.pretrained_clip_model_path)
+
+        for i in range(5):
+            logging.info('>>> CLIP KUN')
+            try:
+                time.sleep(5)
+                self.clip_model = CLIPModel.from_pretrained(args.pretrained_clip_model_path, ignore_mismatched_sizes=True)
+                break
+            except:
+                traceback.print_exc()
+
+        self.logit_scale = self.clip_model.logit_scale.exp()
+        # 放开 text_model 层
+        for key, param in self.clip_model.text_model.named_parameters():
+            param.requires_grad =True
+            logging.info('>>> text model, not freeze; {}'.format(key))
+
+        # 放开 vision_model 层
+        for key, param in self.clip_model.vision_model.named_parameters():
+            if key.__contains__('encoder.layers.31'):
+                param.requires_grad =True
+            elif key.__contains__('encoder.layers.30'):
+                param.requires_grad =True
+            logging.info('>>> vision_model, not freeze; {}'.format(key))
+
+        # self.clip_model.positional_embedding.requires_grad = True
+        # self.clip_model.token_embedding.requires_grad = True
+        self.clip_model.text_projection.requires_grad = True
+        # self.clip_model.ln_final.requires_grad = True
+
+    def encode_image(self, img_input):
+        with torch.cuda.amp.autocast():
+            with torch.no_grad():
+                image_features = self.clip_model.get_image_features(pixel_values=img_input)
+        return image_features.float()
+        
+    def encode_text(self, text_input):
+        with torch.no_grad():
+            # with torch.no_grad():
+            text_features = self.clip_model.get_text_features(**text_input)
+        return text_features.float()
+
+    def forward(self, img_input, text_input, mask_ratio=0):
+        assert image is not None or text is not None, "text and image cannot both be None!"
+
+        if image is None:
+            return self.encode_text(img_input)
+        elif text is None:
+            return self.encode_image(text_input)
+        image_features = self.encode_image(img_input)
+        text_features = self.encode_text(text_input)
+
+        image_features = image_features / image_features.norm(dim=-1, keepdim=True)
+        text_features = text_features / text_features.norm(dim=-1, keepdim=True)
+
+        return image_features, text_features, self.logit_scale.exp()
+
+    def get_similarity(self, img_input, text_input):
+        image_features = self.encode_image(img_input)
+        text_features = self.encode_text(text_input)
+
+        # normalized features
+        image_features = image_features / image_features.norm(dim=1, keepdim=True)
+        text_features = text_features / text_features.norm(dim=1, keepdim=True)
+
+        # cosine similarity as logits
+        logit_scale = self.logit_scale.exp()
+        logits_per_image = logit_scale * image_features @ text_features.t()
+        logits_per_text = logits_per_image.t()
+
+        # shape = [global_batch_size, global_batch_size]
+        return logits_per_image, logits_per_text
+
 
 class CLIP(nn.Module):
     def __init__(self,
