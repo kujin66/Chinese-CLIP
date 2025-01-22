@@ -19,6 +19,7 @@ from torch.utils.data.distributed import DistributedSampler
 
 from torchvision.transforms import Compose, Resize, ToTensor, Normalize, InterpolationMode
 from timm.data import create_transform
+from transformers import CLIPModel, CLIPFeatureExtractor, AutoTokenizer, CLIPTextModel
 
 from cn_clip.clip import _tokenizer
 from cn_clip.clip import tokenize
@@ -33,40 +34,26 @@ def _preprocess_text(text):
     text = text.lower().replace("“", "\"").replace("”", "\"")
     return text
 
-
+def get_len(lmdb_path):
+    if lmdb_path in LMDB_CONFIG:
+        lmdb_path = LMDB_CONFIG[lmdb_path]['lmdb_path']
+    with lmdb.open(lmdb_path, readonly=True, lock=False, readahead=False) as env:
+        with env.begin(write=False) as txn:
+            item_count_value = txn.get("item_count".encode("utf-8"))  # 兼容@lizhuang的写法
+            if item_count_value is None:
+                return txn.stat()['entries']
+            else:
+                return int(pickle.loads(item_count_value))
+                
 class LMDBDataset(Dataset):
     def __init__(self, lmdb_path, split="val", max_txt_length=64, use_augment=False, resolution=224):
         self.lmdb_path = lmdb_path
-
-        # assert LMDB directories exist
-        assert os.path.isdir(lmdb_path), "The LMDB directory {} of {} split does not exist!".format(lmdb_path, split)
-        lmdb_pairs = os.path.join(lmdb_path, "pairs")
-        assert os.path.isdir(lmdb_pairs), "The LMDB directory {} of {} image-text pairs does not exist!".format(lmdb_pairs, split)
-        lmdb_imgs = os.path.join(lmdb_path, "imgs")
-        assert os.path.isdir(lmdb_imgs), "The LMDB directory {} of {} image base64 strings does not exist!".format(lmdb_imgs, split)
-
-        # open LMDB files
-        self.env_pairs = lmdb.open(lmdb_pairs, readonly=True, create=False, lock=False, readahead=False, meminit=False)
-        self.txn_pairs = self.env_pairs.begin(buffers=True)
-        self.env_imgs = lmdb.open(lmdb_imgs, readonly=True, create=False, lock=False, readahead=False, meminit=False)
-        self.txn_imgs = self.env_imgs.begin(buffers=True)
-
-        # fetch number of pairs and images
-        self.number_samples = int(self.txn_pairs.get(key=b'num_samples').tobytes().decode('utf-8'))
-        self.number_images = int(self.txn_imgs.get(key=b'num_images').tobytes().decode('utf-8'))
-        logging.info("{} LMDB file contains {} images and {} pairs.".format(split, self.number_images, self.number_samples))
-
-        super(LMDBDataset, self).__init__()
-
-        # the self.dataset_len will be edited to a larger value by calling pad_dataset()
-        self.dataset_len = self.number_samples
-        self.global_batch_size = 1 # will be modified to the exact global_batch_size after calling pad_dataset()
-
-        self.split = split
-        self.max_txt_length = max_txt_length        
-
-        self.use_augment = use_augment
-        self.transform = self._build_transform(resolution)
+        super(LMDBDatasetKUN, self).__init__()
+        self.img_num = get_len(self.lmdb_path)
+        self.dataset_len = self.img_num
+        self.number_samples = self.img_num
+        self.tokenizer = AutoTokenizer.from_pretrained(self.pretrained_clip_model_path, trust_remote_code=True)
+        self.img_processor = CLIPFeatureExtractor.from_pretrained(self.pretrained_clip_model_path)
 
     def _build_transform(self, resolution):
         if self.split == "train" and self.use_augment:
@@ -101,19 +88,23 @@ class LMDBDataset(Dataset):
 
     def __getitem__(self, index):
         sample_index = index % self.number_samples
+        env = lmdb.open(self.lmdb_path, readonly=True, lock=False, readahead=False)
+        with env.begin() as txn:
+            value = txn.get(str(sample_index).encode("utf-8"))
+            if value:
+                item = pickle.loads(value)
+                image_path, text = item['img_path'], item['prompt']
+            else:
+                logging.info(
+                    ">>>>>> RuntimeError:, key: {}, cur_lmdb_path: {} ".format(str(key), cur_lmdb_path))
+                raise RuntimeError()
 
-        pair = pickle.loads(self.txn_pairs.get("{}".format(sample_index).encode('utf-8')).tobytes())
-        image_id, text_id, raw_text = pair
+        img = Image.open(image_path).convert('RGB')
+        img_input = torch.from_numpy(self.img_processor(img).pixel_values[0])
 
-        image_b64 = self.txn_imgs.get("{}".format(image_id).encode('utf-8')).tobytes()
-        image_b64 = image_b64.decode(encoding="utf8", errors="ignore")
-        image = Image.open(BytesIO(base64.urlsafe_b64decode(image_b64))) # already resized
-        image = self.transform(image)
-
-        text = tokenize([_preprocess_text(raw_text)], context_length=self.max_txt_length)[0]
-        eos_index = text.numpy().tolist().index(_tokenizer.vocab['[SEP]'])
-        return image, text, eos_index
-
+        text_input = self.tokenizer(text, max_length=self.tokenizer.model_max_length, padding="max_length",
+                                            truncation=True, return_tensors="pt")
+        return img_input, text_input
 
 def pad_dataset(dataset, global_batch_size):
     # edit dataset.__len__() of the dataset
@@ -177,6 +168,9 @@ def get_dataset(args, is_train, max_txt_length=64, epoch_id=0):
     dataloader.num_samples = num_samples
     assert num_samples % dataset.global_batch_size == 0
     dataloader.num_batches = num_samples // dataset.global_batch_size
+
+    if arge.rank == 0:
+        logging.info('>>>>>>')
 
     return DataInfo(dataloader, sampler, dataset, epoch_id)
 
